@@ -1158,3 +1158,110 @@ fn test_unsupported_enum_values() {
         serde_json::from_str(&serialized_json).unwrap();
     assert_eq!(provider_metadata, redeserialized_metadata);
 }
+
+fn poll_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct NoopWake;
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut future = Box::pin(future);
+    match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("mock discovery requests should complete immediately"),
+    }
+}
+
+#[test]
+fn test_discovery_with_explicit_expected_issuer() {
+    use crate::{DiscoveryError, HttpRequest, HttpResponse};
+    use std::cell::Cell;
+
+    let discovery_issuer =
+        IssuerUrl::new("https://login.microsoftonline.com/common/v2.0".into()).unwrap();
+    let expected_issuer =
+        IssuerUrl::new("https://login.microsoftonline.com/{tenantid}/v2.0".into()).unwrap();
+    let calls = Cell::new(0);
+    let metadata_issuer = std::cell::RefCell::new(expected_issuer.as_str().to_owned());
+    let client = |request: HttpRequest| {
+        calls.set(calls.get() + 1);
+        assert_eq!(request.method(), http::Method::GET);
+        let body = match request.uri().to_string().as_str() {
+            "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration" => {
+                serde_json::json!({
+                    "issuer": *metadata_issuer.borrow(),
+                    "authorization_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+                    "token_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    "jwks_uri": "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["pairwise"],
+                    "id_token_signing_alg_values_supported": ["RS256"]
+                })
+            }
+            "https://login.microsoftonline.com/common/discovery/v2.0/keys" => {
+                serde_json::json!({ "keys": [] })
+            }
+            unexpected => panic!("unexpected discovery request: {unexpected}"),
+        };
+        std::future::ready(Ok::<HttpResponse, std::io::Error>(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(serde_json::to_vec(&body).unwrap())
+                .unwrap(),
+        ))
+    };
+
+    let metadata = poll_ready(CoreProviderMetadata::discover_advanced_async(
+        &discovery_issuer,
+        &expected_issuer,
+        &client,
+    ))
+    .unwrap();
+    assert_eq!(metadata.issuer(), &expected_issuer);
+    assert_eq!(
+        calls.get(),
+        2,
+        "discovery must also fetch the configured JWKS"
+    );
+
+    // Ordinary discovery must remain strict, even for a known provider's template.
+    calls.set(0);
+    assert!(matches!(
+        poll_ready(CoreProviderMetadata::discover_async(
+            discovery_issuer.clone(),
+            &client,
+        )),
+        Err(DiscoveryError::Validation(_))
+    ));
+    assert_eq!(
+        calls.get(),
+        1,
+        "reject unexpected issuers before fetching keys"
+    );
+
+    *metadata_issuer.borrow_mut() = "https://attacker.example/issuer".into();
+    calls.set(0);
+    assert!(matches!(
+        poll_ready(CoreProviderMetadata::discover_advanced_async(
+            &discovery_issuer,
+            &expected_issuer,
+            &client,
+        )),
+        Err(DiscoveryError::Validation(_))
+    ));
+    assert_eq!(calls.get(), 1);
+
+    // The default async API still accepts an exact match and fetches its keys.
+    *metadata_issuer.borrow_mut() = discovery_issuer.as_str().to_owned();
+    calls.set(0);
+    let metadata = poll_ready(CoreProviderMetadata::discover_async(
+        discovery_issuer.clone(),
+        &client,
+    ))
+    .unwrap();
+    assert_eq!(metadata.issuer(), &discovery_issuer);
+    assert_eq!(calls.get(), 2);
+}

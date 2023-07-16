@@ -1366,3 +1366,128 @@ fn test_new_user_info_claims() {
         serde_json::to_value(claims_jwt).unwrap().as_str().unwrap()
     );
 }
+
+const MICROSOFT_ISSUER_TEMPLATE: &str = "https://login.microsoftonline.com/{tenantid}/v2.0";
+const TRUSTED_MICROSOFT_ISSUER: &str =
+    "https://login.microsoftonline.com/12345678-1234-1234-1234-123456789abc/v2.0";
+
+fn microsoft_test_token(issuer: &str, audience: &str, expires: i64) -> CoreIdToken {
+    let key = CoreRsaPrivateSigningKey::from_pem(TEST_RSA_PRIV_KEY, None).unwrap();
+    CoreIdToken::new(
+        CoreIdTokenClaims::new(
+            IssuerUrl::new(issuer.to_owned()).unwrap(),
+            vec![Audience::new(audience.to_owned())],
+            Utc.timestamp_opt(expires, 0).single().unwrap(),
+            Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            StandardClaims::new(SubjectIdentifier::new("test-user".into())),
+            Default::default(),
+        )
+        .set_nonce(Some(Nonce::new("login-nonce".into()))),
+        &key,
+        CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn microsoft_test_verifier() -> CoreIdTokenVerifier<'static> {
+    CoreIdTokenVerifier::new_public_client(
+        ClientId::new("test-client".into()),
+        IssuerUrl::new(MICROSOFT_ISSUER_TEMPLATE.into()).unwrap(),
+        CoreJsonWebKeySet::new(vec![serde_json::from_str(TEST_RSA_PUB_KEY).unwrap()]),
+    )
+    .set_time_fn(|| Utc.timestamp_opt(1_700_000_000, 0).single().unwrap())
+}
+
+#[test]
+fn test_microsoft_issuer_hook_is_opt_in_and_scoped_to_trusted_issuers() {
+    let verifier = microsoft_test_verifier();
+    let nonce = Nonce::new("login-nonce".into());
+    let token = microsoft_test_token(TRUSTED_MICROSOFT_ISSUER, "test-client", 1_700_003_600);
+    assert!(matches!(
+        token.claims(&verifier, &nonce),
+        Err(ClaimsVerificationError::InvalidIssuer(_))
+    ));
+    let verifier =
+        verifier.set_other_issuer_verifier_fn(|issuer| issuer.as_str() == TRUSTED_MICROSOFT_ISSUER);
+    assert!(token.claims(&verifier, &nonce).is_ok());
+    for issuer in [
+        MICROSOFT_ISSUER_TEMPLATE,
+        TRUSTED_MICROSOFT_ISSUER,
+        "https://attacker.example/12345678-1234-1234-1234-123456789abc/v2.0",
+        "https://login.microsoftonline.com/untrusted-tenant/v2.0",
+        "https://login.microsoftonline.com.attacker.example/12345678-1234-1234-1234-123456789abc/v2.0",
+    ] {
+        let token = microsoft_test_token(issuer, "test-client", 1_700_003_600);
+        assert_eq!(token.claims(&verifier, &nonce).is_ok(),
+            issuer == TRUSTED_MICROSOFT_ISSUER || issuer == MICROSOFT_ISSUER_TEMPLATE);
+    }
+    let exact = microsoft_test_token(MICROSOFT_ISSUER_TEMPLATE, "test-client", 1_700_003_600);
+    assert!(exact
+        .claims(
+            &microsoft_test_verifier().set_other_issuer_verifier_fn(|_| false),
+            &nonce
+        )
+        .is_ok());
+}
+
+#[test]
+fn test_microsoft_issuer_hook_preserves_other_token_checks() {
+    let verifier = microsoft_test_verifier()
+        .set_other_issuer_verifier_fn(|issuer| issuer.as_str() == TRUSTED_MICROSOFT_ISSUER);
+    let nonce = Nonce::new("login-nonce".into());
+    let wrong_audience =
+        microsoft_test_token(TRUSTED_MICROSOFT_ISSUER, "another-client", 1_700_003_600);
+    assert!(matches!(
+        wrong_audience.claims(&verifier, &nonce),
+        Err(ClaimsVerificationError::InvalidAudience(_))
+    ));
+    let expired = microsoft_test_token(TRUSTED_MICROSOFT_ISSUER, "test-client", 1_699_999_999);
+    assert!(matches!(
+        expired.claims(&verifier, &nonce),
+        Err(ClaimsVerificationError::Expired(_))
+    ));
+    let valid = microsoft_test_token(TRUSTED_MICROSOFT_ISSUER, "test-client", 1_700_003_600);
+    assert!(matches!(
+        valid.claims(&verifier, &Nonce::new("wrong-nonce".into())),
+        Err(ClaimsVerificationError::InvalidNonce(_))
+    ));
+    let serialized = serde_json::to_value(&valid).unwrap();
+    let (prefix, signature) = serialized.as_str().unwrap().rsplit_once('.').unwrap();
+    let first = if signature.starts_with('A') { 'B' } else { 'A' };
+    let tampered: CoreIdToken = serde_json::from_value(serde_json::Value::String(format!(
+        "{prefix}.{first}{}",
+        &signature[1..]
+    )))
+    .unwrap();
+    assert!(matches!(
+        tampered.claims(&verifier, &nonce),
+        Err(ClaimsVerificationError::SignatureVerification(_))
+    ));
+}
+
+#[test]
+fn test_other_issuer_hook_does_not_accept_missing_issuer_claims() {
+    let key = CoreRsaPrivateSigningKey::from_pem(TEST_RSA_PRIV_KEY, None).unwrap();
+    let token = TestClaimsJsonWebToken::new(
+        TestClaims {
+            aud: Some(vec![Audience::new("test-client".into())]),
+            iss: None,
+            payload: "test".into(),
+        },
+        &key,
+        &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+    )
+    .unwrap();
+    let verifier = CoreJwtClaimsVerifier::new(
+        ClientId::new("test-client".into()),
+        IssuerUrl::new(MICROSOFT_ISSUER_TEMPLATE.into()).unwrap(),
+        CoreJsonWebKeySet::new(vec![serde_json::from_str(TEST_RSA_PUB_KEY).unwrap()]),
+    )
+    .set_other_issuer_verifier_fn(|_| true);
+    assert!(matches!(
+        verifier.verified_claims(token),
+        Err(ClaimsVerificationError::InvalidIssuer(_))
+    ));
+}

@@ -304,15 +304,24 @@ where
     }
 
     /// Asynchronously fetches the OpenID Connect Discovery document and associated JSON Web Key Set
-    /// from the OpenID Connect Provider.
-    pub fn discover_async<'c, C>(
-        issuer_url: IssuerUrl,
+    /// from the OpenID Connect Provider, validating the returned issuer against an explicit
+    /// expected value. The discovery URL and expected issuer may differ for providers such as
+    /// Microsoft, whose `common` metadata declares a `{tenantid}` issuer template.
+    ///
+    /// The expected issuer must come from trusted configuration, not from an unverified token
+    /// or the discovery response itself. Other validation and JSON Web Key Set fetching are
+    /// unchanged.
+    pub fn discover_advanced_async<'c, C>(
+        issuer_url: &IssuerUrl,
+        expected_issuer_url: &IssuerUrl,
         http_client: &'c C,
     ) -> impl Future<Output = Result<Self, DiscoveryError<<C as AsyncHttpClient<'c>>::Error>>> + 'c
     where
         Self: 'c,
         C: AsyncHttpClient<'c>,
     {
+        let issuer_url = issuer_url.clone();
+        let expected_issuer_url = expected_issuer_url.clone();
         Box::pin(async move {
             let discovery_url = issuer_url
                 .join(CONFIG_URL_SUFFIX)
@@ -327,7 +336,7 @@ where
                 .await
                 .map_err(DiscoveryError::Request)
                 .and_then(|http_response| {
-                    Self::discovery_response(&issuer_url, &discovery_url, http_response)
+                    Self::discovery_response(&expected_issuer_url, &discovery_url, http_response)
                 })?;
 
             JsonWebKeySet::fetch_async(provider_metadata.jwks_uri(), http_client)
@@ -336,6 +345,21 @@ where
                     jwks,
                     ..provider_metadata
                 })
+        })
+    }
+
+    /// Asynchronously fetches the OpenID Connect Discovery document and associated JSON Web Key Set
+    /// from the OpenID Connect Provider.
+    pub fn discover_async<'c, C>(
+        issuer_url: IssuerUrl,
+        http_client: &'c C,
+    ) -> impl Future<Output = Result<Self, DiscoveryError<<C as AsyncHttpClient<'c>>::Error>>> + 'c
+    where
+        Self: 'c,
+        C: AsyncHttpClient<'c>,
+    {
+        Box::pin(async move {
+            Self::discover_advanced_async(&issuer_url, &issuer_url, http_client).await
         })
     }
 

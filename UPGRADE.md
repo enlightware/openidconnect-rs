@@ -308,3 +308,26 @@ method from the `JwsSignatureAlgorithm` trait to the `JsonWebKey` trait.
 
 The `AccessTokenHash::from_token()` and `AuthorizationCodeHash::from_code()` methods now require
 a `JsonWebKey` as an argument.
+
+## Fork-specific Microsoft issuer support
+
+This fork carries the Microsoft tenant-issuer hooks on top of upstream 4.1.0 (Git revision
+`e20ddbb01ca68356f2979bc125f5613ab45b4e7e`).
+OAuth2 5 and Reqwest 0.12 support come from upstream; a separate HTTP-version
+adapter is no longer needed.
+
+`ProviderMetadata::discover_advanced_async` retains separate discovery and
+expected issuer URLs. It now takes `&IssuerUrl`, `&IssuerUrl`, and a borrowed
+HTTP client implementing `AsyncHttpClient`, following the upstream 4.x HTTP
+client API. Ordinary `discover_async` still requires the metadata issuer to
+match the discovery issuer exactly.
+
+`IdTokenVerifier::set_other_issuer_verifier_fn` retains its existing callback
+API. Exact issuer matches are accepted; alternative issuers require explicit
+callback approval. The callback does not bypass signature, audience, nonce, or
+time validation. Configure trusted issuer rules independently of token contents
+and keep the issuer check enabled; accepting every issuer is unsafe.
+
+Microsoft tenant-independent discovery and concrete token issuers remain distinct.
+Applications must enforce the appropriate tenant and signing-key issuer policies;
+these generic hooks do not implement a complete Microsoft-specific validation policy.

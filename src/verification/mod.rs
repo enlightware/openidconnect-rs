@@ -125,6 +125,7 @@ where
     client_secret: Option<ClientSecret>,
     iss_required: bool,
     issuer: IssuerUrl,
+    other_issuer_verifier_fn: Arc<dyn Fn(&IssuerUrl) -> bool + 'a + Send + Sync>,
     is_signature_check_enabled: bool,
     other_aud_verifier_fn: Arc<dyn Fn(&Audience) -> bool + 'a + Send + Sync>,
     signature_keys: JsonWebKeySet<K>,
@@ -155,6 +156,8 @@ where
             client_secret: None,
             iss_required: true,
             issuer,
+            // Secure default: reject all alternative issuers.
+            other_issuer_verifier_fn: Arc::new(|_| false),
             is_signature_check_enabled: true,
             // Secure default: reject all other audiences as untrusted, since any other audience
             // can potentially impersonate the user when by sending its copy of these claims
@@ -171,6 +174,14 @@ where
 
     pub fn require_issuer_match(mut self, iss_required: bool) -> Self {
         self.iss_required = iss_required;
+        self
+    }
+
+    pub fn set_other_issuer_verifier_fn<T>(mut self, verifier: T) -> Self
+    where
+        T: Fn(&IssuerUrl) -> bool + 'a + Send + Sync,
+    {
+        self.other_issuer_verifier_fn = Arc::new(verifier);
         self
     }
 
@@ -318,7 +329,7 @@ where
             let unverified_claims = jwt.unverified_payload_ref();
             if self.iss_required {
                 if let Some(issuer) = unverified_claims.issuer() {
-                    if *issuer != self.issuer {
+                    if *issuer != self.issuer && !(self.other_issuer_verifier_fn)(issuer) {
                         return Err(ClaimsVerificationError::InvalidIssuer(format!(
                             "expected `{}` (found `{}`)",
                             *self.issuer, **issuer
@@ -666,6 +677,28 @@ where
     /// information.
     pub fn insecure_disable_signature_check(mut self) -> Self {
         self.jwt_verifier = self.jwt_verifier.require_signature_check(false);
+        self
+    }
+
+    /// Specifies a validator for issuer claims that differ from the configured issuer.
+    ///
+    /// Exact issuer matches remain accepted. Alternative issuers are rejected by default;
+    /// this callback must return `true` only for explicitly trusted alternatives, such as a
+    /// concrete Microsoft tenant issuer corresponding to configured `{tenantid}` metadata.
+    /// Missing issuer claims are still rejected, and signature, audience, nonce, and time
+    /// validation remain enabled.
+    ///
+    /// # Security
+    ///
+    /// OpenID Connect normally requires an exact issuer match. This hook is only for providers
+    /// that require additional issuer validation. The callback receives an unverified claim:
+    /// do not use it to select or fetch signing keys, or to trust arbitrary hosts or tenants.
+    /// Returning `true` does not authenticate a token; all remaining checks must also succeed.
+    pub fn set_other_issuer_verifier_fn<T>(mut self, verifier: T) -> Self
+    where
+        T: Fn(&IssuerUrl) -> bool + 'a + Send + Sync,
+    {
+        self.jwt_verifier = self.jwt_verifier.set_other_issuer_verifier_fn(verifier);
         self
     }
 
